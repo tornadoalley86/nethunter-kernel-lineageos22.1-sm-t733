@@ -51,7 +51,7 @@ nethunter/
 
 1. **Clone this repository**:
    ```bash
-   git clone https://github.com/tornado86/nethunter-sm-t733.git
+   git clone https://github.com/tornado86/nethunter-kernel-sm-t733.git
    cd nethunter-sm-t733
    ```
 
