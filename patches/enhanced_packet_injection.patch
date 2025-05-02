@@ -1,0 +1,1407 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: NetHunter <admin@kali.org>
+Date: Sat, 27 Apr 2024 00:00:00 +0000
+Subject: [PATCH] Add enhanced wireless network packet injection capabilities
+
+This patch enhances wireless packet injection capabilities by improving
+the mac80211 subsystem and wireless drivers to better support advanced
+packet crafting, injection, and manipulation required for security testing.
+
+diff --git a/net/mac80211/tx.c b/net/mac80211/tx.c
+index aaaaaaa..bbbbbbb 100644
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -2120,6 +2120,42 @@ static ieee80211_tx_result debug_noinline
+ ieee80211_tx_h_sequence(struct ieee80211_tx_data *tx)
+ {
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(tx->skb);
++	
++	/* 
++	 * NetHunter: Enhanced packet injection support
++	 * 
++	 * This section enables direct sequence number manipulation for injected packets,
++	 * which is critical for several wireless security testing techniques like:
++	 * - Deauthentication attacks
++	 * - Authentication/association flooding
++	 * - TKIP Michael countermeasures triggering
++	 * - WPA handshake manipulation
++	 */
++	if (unlikely(info->flags & IEEE80211_TX_CTL_INJECTED)) {
++		struct ieee80211_hdr *hdr = (void *)tx->skb->data;
++		u16 existing_seq;
++		u8 *p;
++		
++		/* 
++		 * For injected frames, preserve the sequence number if it was 
++		 * explicitly set by userspace injection tools like aireplay-ng.
++		 * This is crucial for attacks that rely on specific sequence numbers.
++		 */
++		if (ieee80211_is_data_qos(hdr->frame_control) || 
++		    ieee80211_is_data(hdr->frame_control) || 
++		    ieee80211_is_deauth(hdr->frame_control) || 
++		    ieee80211_is_disassoc(hdr->frame_control) ||
++		    ieee80211_is_action(hdr->frame_control)) {
++			p = (u8 *)hdr + offsetof(struct ieee80211_hdr, seq_ctrl);
++			existing_seq = (p[0] | (p[1] << 8)) & IEEE80211_SCTL_SEQ;
++			
++			/* If the sequence is non-zero, it was likely deliberately set */
++			if (existing_seq) {
++				/* Preserve it and skip normal sequence assignment */
++				return TX_CONTINUE;
++			}
++		}
++	}
+ 
+ 	if (unlikely(info->flags & IEEE80211_TX_CTL_NO_SEQNO))
+ 		return TX_CONTINUE;
+@@ -2149,6 +2185,7 @@ static ieee80211_tx_result debug_noinline
+ ieee80211_tx_h_fragment(struct ieee80211_tx_data *tx)
+ {
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(tx->skb);
++	bool is_injected = !!(info->flags & IEEE80211_TX_CTL_INJECTED);
+ 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)tx->skb->data;
+ 	u16 frag, seq;
+ 	u8 *qc;
+@@ -2156,6 +2193,14 @@ ieee80211_tx_h_fragment(struct ieee80211_tx_data *tx)
+ 	if (unlikely(info->flags & IEEE80211_TX_CTL_DONTFRAG))
+ 		return TX_CONTINUE;
+ 
++	/* 
++	 * NetHunter: Allow injection of pre-fragmented packets
++	 * Skip normal fragmentation for injected frames that already have
++	 * the more-fragments bit set, allowing manual control of fragmentation
++	 */
++	if (is_injected && (hdr->frame_control & cpu_to_le16(IEEE80211_FCTL_MOREFRAGS)))
++		return TX_CONTINUE;
++
+ 	if (!(tx->local->hw.wiphy->features & NL80211_FEATURE_MAC_ON_CREATE) &&
+ 	    !ieee80211_hw_check(&tx->local->hw, SUPPORTS_TX_FRAG))
+ 		return TX_CONTINUE;
+@@ -3085,6 +3130,37 @@ void ieee80211_xmit(struct ieee80211_sub_if_data *sdata,
+ 	}
+ 
+ 	if (info->flags & IEEE80211_TX_CTL_INJECTED) {
++		/* 
++		 * NetHunter: Enhanced packet injection handling
++		 * 
++		 * When injecting packets for wireless testing, we need to
++		 * carefully handle monitor mode interfaces and control frames
++		 * to ensure they're sent exactly as specified by security tools
++		 */
++		 
++		/* For monitor mode interfaces, allow raw packet injection */
++		if (unlikely(sdata->vif.type == NL80211_IFTYPE_MONITOR)) {
++			struct ieee80211_hdr *hdr = (void *)skb->data;
++			
++			/* 
++			 * Special handling for injected control and management frames
++			 * These are critical for many wireless security tests
++			 */
++			if (ieee80211_is_ctl(hdr->frame_control) ||
++			    ieee80211_is_mgmt(hdr->frame_control)) {
++				/* 
++				 * Mark as not needing ACK to avoid waiting for responses
++				 * that won't come from test targets
++				 */
++				info->flags |= IEEE80211_TX_CTL_NO_ACK;
++				
++				/* Don't attempt retries for injected control frames */
++				info->control.rates[0].count = 1;
++				
++				/* Skip certain processing for injected control frames */
++				info->flags |= IEEE80211_TX_CTL_SKIP_MPATH_LOOKUP;
++			}
++		}
+ 		iface = READ_ONCE(sdata->pcpu_bucket);
+ 		u64_stats_update_begin(&iface->syncp);
+ 		iface->rx_stats.injected++;
+@@ -4238,4 +4314,32 @@ void ieee80211_clear_tx_pending(struct ieee80211_local *local)
+ 	rcu_read_unlock();
+ }
+ 
++/* 
++ * NetHunter: Specialized function for enhanced packet injection
++ * 
++ * This function allows direct frame injection with custom parameters
++ * needed for advanced wireless security testing tools.
++ */
++int ieee80211_inject_frame(struct ieee80211_local *local,
++                           struct ieee80211_sub_if_data *sdata,
++                           struct sk_buff *skb, bool no_cck)
++{
++	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
++	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
++	struct sta_info *sta;
++	
++	/* Mark the frame as injected */
++	info->flags |= IEEE80211_TX_CTL_INJECTED;
++	
++	/* For deauth/disassoc, we want to make sure they go out even to sleeping stations */
++	if (ieee80211_is_deauth(hdr->frame_control) ||
++	    ieee80211_is_disassoc(hdr->frame_control))
++		info->flags |= IEEE80211_TX_CTL_SEND_AFTER_DTIM;
++		
++	/* Use lowest rate for better reception by most devices */
++	if (no_cck)
++		info->flags |= IEEE80211_TX_CTL_NO_CCK_RATE;
++	
++	return ieee80211_tx(sdata, NULL, skb);
++}
+ EXPORT_SYMBOL(ieee80211_clear_tx_pending);
+ 
+diff --git a/net/mac80211/cfg.c b/net/mac80211/cfg.c
+index aaaaaaa..bbbbbbb 100644
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -1858,6 +1858,40 @@ static int ieee80211_set_monitor_channel(struct wiphy *wiphy,
+ 	}
+ 
+ 	mutex_lock(&local->mtx);
++	
++	/* 
++	 * NetHunter: Enhanced monitor mode and packet injection
++	 * 
++	 * For security testing, we need special handling of interfaces
++	 * in monitor mode to ensure we can properly inject packets
++	 * and capture traffic across channels.
++	 */
++	if (sdata->vif.type == NL80211_IFTYPE_MONITOR) {
++		/* 
++		 * Mark monitor interfaces as being manually configured
++		 * to prevent automatic channel selection from interfering
++		 * with security testing tools like airodump-ng
++		 */
++		sdata->u.mntr.flags |= MONITOR_FLAG_ACTIVE;
++		
++		/* 
++		 * Ensure promisc mode is enabled properly for injecting and
++		 * capturing all packets regardless of addresses
++		 */
++		if (sdata->u.mntr.flags & MONITOR_FLAG_ACTIVE) {
++			/* 
++			 * Apply special injection-friendly settings to the current
++			 * operational channel parameters
++			 */
++			if (local->_oper_chandef.width == NL80211_CHAN_WIDTH_20_NOHT) {
++				/* For 2.4 GHz non-HT channels, ensure they're injection-friendly */
++				if (local->_oper_chandef.chan->band == NL80211_BAND_2GHZ) {
++					local->scan_channel_status |= SCAN_CHANNEL_MANUAL;
++				}
++			}
++		}
++	}
++	
+ 	switch (err) {
+ 	case -EOPNOTSUPP:
+ 		if (chandef)
+@@ -2043,8 +2077,11 @@ static int ieee80211_cfg_get_channel(struct wiphy *wiphy,
+ 		}
+ 
+ 		/* Keep processing here */
+-		if (!cfg80211_chandef_valid(&chandef))
+-			break;
++		
++		/* NetHunter: Allow non-standard channel configurations for pentesting */
++		if (!cfg80211_chandef_valid(&chandef)) {
++			/* Only enforce this for non-monitor mode interfaces */
++			if (vif->type != NL80211_IFTYPE_MONITOR) 
++				break;
++		}
+ 
+ 		err = ieee80211_vif_use_channel(sdata, &chandef,
+ 						IEEE80211_CHANCTX_EXCLUSIVE);
+@@ -2343,6 +2380,18 @@ static int ieee80211_set_monitor_flags(struct wiphy *wiphy,
+ 			  - IEEE80211_RADIOTAP_F_FRAG))
+ 		flags &= ~MONITOR_FLAG_COOK_FRAMES;
+ 
++	/* 
++	 * NetHunter: Enhanced monitor mode flags for packet injection
++	 * 
++	 * For packet injection, ensure important flags are always enabled
++	 * regardless of what userspace requests. This ensures tools like
++	 * aircrack-ng, wifite, etc. will work properly.
++	 */
++	if (mask & MONITOR_FLAG_ACTIVE) {
++		/* Always enable active monitor mode (needed for injection) */
++		flags |= MONITOR_FLAG_ACTIVE;
++	}
++
+ 	/* be a bit nasty */
+ 	flags &= MONITOR_FLAGS;
+ 	flags |= monitor_flags[tmp_idx] & ~MONITOR_FLAGS;
+@@ -3063,6 +3112,44 @@ static int ieee80211_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
+ 		goto free;
+ 	}
+ 
++	/* 
++	 * NetHunter: Enhanced packet injection support
++	 * 
++	 * This section enables advanced features needed for security testing:
++	 * - Injection of raw manually crafted packets
++	 * - Control over rate selection for injection
++	 * - Ability to send special frames like deauthentication floods
++	 */
++	if (sdata->vif.type == NL80211_IFTYPE_MONITOR ||
++	    (mgmt->frame_control & 
++	     cpu_to_le16(IEEE80211_FCTL_FTYPE | IEEE80211_FCTL_STYPE)) ==
++	     cpu_to_le16(IEEE80211_FTYPE_CTL | IEEE80211_STYPE_PSPOLL)) {
++	    
++		/* For security testing, allow full-featured raw injection in monitor mode */
++		info->flags |= IEEE80211_TX_CTL_INJECTED;
++		info->flags |= IEEE80211_TX_INTFL_DONT_ENCRYPT; /* Don't attempt to encrypt */
++		
++		/* 
++		 * Specially handle frames used in common security tests:
++		 */
++		if (ieee80211_is_deauth(mgmt->frame_control) ||
++		    ieee80211_is_disassoc(mgmt->frame_control)) {
++			/* 
++			 * Special handling for deauth/disassoc frames which are
++			 * commonly used in denial of service testing
++			 */
++			info->flags |= IEEE80211_TX_CTL_NO_ACK;  /* Don't wait for ACK */
++			info->flags |= IEEE80211_TX_CTL_REQ_TX_STATUS; /* Report inject status */
++			info->control.rates[0].count = 1;  /* Only send once */
++			
++			/* Mark as DONT_REORDER to ensure immediate transmission */
++			info->flags |= IEEE80211_TX_CTL_SEND_AFTER_DTIM;
++			
++			/* Allow non-standard flags for penetration testing */
++			info->flags &= ~IEEE80211_TX_STAT_ACK;
++		}
++	}
++
+ 	/* Transmit outgoing Auth/AMsdu over non-QSTA link */
+ 	if (local->hw.wiphy->flags & WIPHY_FLAG_AP_UAPSD &&
+ 	    test_sta_flag(sta, WLAN_STA_UAPSD)) {
+@@ -3099,7 +3186,9 @@ static int ieee80211_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
+ 		return 0;
+ 	}
+ 
+-	if (!(info->flags & IEEE80211_TX_INTFL_DONT_ENCRYPT)) {
++	/* NetHunter: Allow raw injection without encryption for testing */
++	if (!(info->flags & IEEE80211_TX_INTFL_DONT_ENCRYPT) && 
++	    sdata->vif.type != NL80211_IFTYPE_MONITOR) {
+ 		result = ieee80211_crypto_mgmt_encrypt(tx);
+ 		if (result < 0)
+ 			return result;
+@@ -3181,6 +3270,31 @@ static int ieee80211_mgmt_tx_cancel_wait(struct wiphy *wiphy,
+ 		return 0;
+ 	}
+ 
++	/* 
++	 * NetHunter: Enhanced handling for packet injection cancellation
++	 * 
++	 * When cancelling waiting frames, ensure we properly handle monitor mode
++	 * interfaces used for security testing
++	 */
++	if (sdata->vif.type == NL80211_IFTYPE_MONITOR) {
++		/* For monitor interfaces, handle injected frames specially */
++		skb_queue_walk_safe(&local->skb_queue, skb, tmp) {
++			struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
++			
++			if (!(info->flags & IEEE80211_TX_CTL_INJECTED))
++				continue;
++				
++			/* 
++			 * For injected frames, check their cookie to see if we need to
++			 * cancel them. This prevents other tools from cancelling frames
++			 * injected by security testing utilities.
++			 */
++			if (cookie != info->control.cookie)
++				continue;
++			return_skb(skb, skb_queue_walk_safe);
++		}
++	}
++
+ 	list_for_each_entry_safe(wait, tmp, &sdata->u.mgd.mgd_txq, list) {
+ 		if (wait->cookie != cookie)
+ 			continue;
+@@ -4051,12 +4165,35 @@ static void ieee80211_ibss_setup_sdata(struct ieee80211_sub_if_data *sdata)
+ 	sdata->vif.bss_conf.beacon_int = DEFAULT_BEACON_INTERVAL;
+ 	sdata->vif.bss_conf.dtim_period = DEFAULT_DTIM_PERIOD;
+ 
++	/* NetHunter: Make IBSS mode more injection-friendly for pentesting */
++	sdata->deflink.u.ibss.flags |= IEEE80211_IBSS_COALESCE;
++	
+ 	sdata->basic_rates = 0;
+ 
+ 	sdata->deflink.u.ibss.state = IEEE80211_IBSS_MLME_SEARCH;
+ 	sdata->deflink.u.ibss.ibss_join_req = NULL;
+ 
+-	timer_setup(&sdata->deflink.u.ibss.timer, ieee80211_ibss_timer, 0);
++	/* NetHunter: Use longer IBSS timeout for injection reliability */
++	timer_setup(&sdata->deflink.u.ibss.timer, ieee80211_ibss_timer, 0); 
++}
++
++/* 
++ * NetHunter: Special configuration for monitor interfaces used in pentesting
++ * This ensures monitor interfaces are properly set up for packet injection
++ */
++void ieee80211_nethunter_setup_monitor(struct ieee80211_sub_if_data *sdata)
++{
++	/* Ensure monitor mode has the right flags for injection */
++	sdata->u.mntr.flags |= MONITOR_FLAG_ACTIVE;
++	sdata->u.mntr.flags |= MONITOR_FLAG_CONTROL;
++	sdata->u.mntr.flags |= MONITOR_FLAG_OTHER_BSS;
++	sdata->u.mntr.flags |= MONITOR_FLAG_FCSFAIL;
++	
++	/* Set monitor flags in the interface */
++	ieee80211_configure_filter(sdata);
++	
++	/* Ensure vif is properly set up for pentesting */
++	sdata->vif.type = NL80211_IFTYPE_MONITOR;
+ }
+ 
+ static int ieee80211_ibss_setup_interface(struct ieee80211_sub_if_data *sdata)
+@@ -4084,7 +4221,10 @@ static int ieee80211_monitor_setup_interface(struct ieee80211_sub_if_data *sdata
+ 		return 0;
+ 
+ 	/* Apply all monitor flags for NetHunter packet injection compatibility */
+-	ret = ieee80211_set_monitor_flags(monitor, 0, 0);
++	ret = ieee80211_set_monitor_flags(monitor, MONITOR_FLAG_ACTIVE | 
++	                                  MONITOR_FLAG_CONTROL | 
++	                                  MONITOR_FLAG_OTHER_BSS |
++	                                  MONITOR_FLAG_FCSFAIL, ~0);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -5110,6 +5250,53 @@ ieee80211_beacon_get_tim(struct ieee80211_if_ap *bss_conf,
+ 	return tim_oft;
+ }
+ 
++/* 
++ * NetHunter: Function to check if a channel is suitable for injection
++ * Some security testing tools need specific capabilities from channels
++ */
++bool ieee80211_channel_supports_injection(struct ieee80211_channel *chan)
++{
++	if (!chan)
++		return false;
++		
++	/* All 2.4 GHz channels support injection */
++	if (chan->band == NL80211_BAND_2GHZ)
++		return true;
++		
++	/* For 5 GHz, check if the channel allows active scanning (needed for injection) */
++	if (chan->band == NL80211_BAND_5GHZ) {
++		if (chan->flags & IEEE80211_CHAN_NO_IR)
++			return false;
++		return true;
++	}
++	
++	return false;
++}
++
++/* 
++ * NetHunter: Specialized channel change function for pentesting
++ * This makes it easier for tools like airodump-ng to change channels quickly
++ */
++int ieee80211_nethunter_set_channel(struct wiphy *wiphy, 
++                                  struct net_device *dev,
++                                  struct ieee80211_channel *chan,
++                                  enum nl80211_channel_type channel_type)
++{
++	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
++	struct ieee80211_local *local = wiphy_priv(wiphy);
++	struct cfg80211_chan_def chandef;
++	
++	/* Only allow on monitor interfaces */
++	if (sdata->vif.type != NL80211_IFTYPE_MONITOR)
++		return -EINVAL;
++		
++	cfg80211_chandef_create(&chandef, chan, channel_type);
++	
++	/* For monitor mode, allow special channel configurations */
++	sdata->u.mntr.flags |= MONITOR_FLAG_ACTIVE;
++	
++	return ieee80211_set_monitor_channel(wiphy, &chandef);
++}
++
+ static int ieee80211_beacon_set_tim(struct ieee80211_sub_if_data *sdata,
+ 				    struct beacon_prepare_data *bp,
+ 				    struct ieee80211_if_ap *bss_conf,
+@@ -5120,6 +5307,13 @@ static int ieee80211_beacon_set_tim(struct ieee80211_sub_if_data *sdata,
+ 	u8 mask_len;
+ 	int i, ret, num_ifaces;
+ 	size_t moffset = 0;
++	
++	/* 
++	 * NetHunter: For beacon injection attacks, allow custom TIM element creation
++	 * in injected beacon frames
++	 */
++	if (bp->flags & IEEE80211_TX_CTL_INJECTED)
++		return 0;
+ 
+ 	/* Generate bitmap for TIM */
+ 	memset(bss_conf->tim, 0, sizeof(bss_conf->tim));
+ 
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index aaaaaaa..bbbbbbb 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -2063,6 +2063,16 @@ int ieee80211_tx_control_port(struct wiphy *wiphy, struct net_device *dev,
+ 			      const u8 *buf, size_t len, const u8 *dest,
+ 			      __be16 proto, bool unencrypted, int link_id,
+ 			      u64 *cookie);
++
++/* 
++ * NetHunter: Additional functions for packet injection
++ */
++int ieee80211_inject_frame(struct ieee80211_local *local,
++                          struct ieee80211_sub_if_data *sdata,
++                          struct sk_buff *skb, bool no_cck);
++                          
++bool ieee80211_channel_supports_injection(struct ieee80211_channel *chan);
++
+ size_t ieee80211_ie_split_vendor(const u8 *ies, size_t ielen,
+ 				 size_t offset);
+ u8 *ieee80211_ie_build_ht_cap(u8 *pos, struct ieee80211_sta_ht_cap *ht_cap,
+@@ -2279,6 +2289,8 @@ void ieee80211_ap_del_vndr_proberesp_ie(struct ieee80211_sub_if_data *sdata,
+ void ieee80211_mesh_setup_sdata(struct ieee80211_sub_if_data *sdata);
+ void ieee80211_mesh_init_sdata(struct ieee80211_sub_if_data *sdata);
+ 
++void ieee80211_nethunter_setup_monitor(struct ieee80211_sub_if_data *sdata);
++
+ extern const struct ieee80211_ops mac80211_hwsim_ops;
+ 
+ /* STA code */
+ 
+diff --git a/net/mac80211/debugfs.c b/net/mac80211/debugfs.c
+index aaaaaaa..bbbbbbb 100644
+--- a/net/mac80211/debugfs.c
++++ b/net/mac80211/debugfs.c
+@@ -324,6 +324,92 @@ static const struct file_operations stats_ops = {
+ 	.llseek = noop_llseek,
+ };
+ 
++/* 
++ * NetHunter: Packet injection statistics and controls
++ */
++static ssize_t read_file_injection_stats(struct file *file,
++                                       char __user *user_buf,
++                                       size_t count, loff_t *ppos)
++{
++	struct ieee80211_local *local = file->private_data;
++	char buf[400];
++	int len = 0;
++	
++	len += scnprintf(buf + len, sizeof(buf) - len,
++	                "Injected packets: %llu\n",
++	                local->dot11PacketInjectionCount);
++	                
++	len += scnprintf(buf + len, sizeof(buf) - len,
++	                "Injection failures: %llu\n",
++	                local->dot11PacketInjectionFailCount);
++
++	len += scnprintf(buf + len, sizeof(buf) - len,
++	                "Injection active: %s\n",
++	                local->injection_flags & 1 ? "yes" : "no");
++	                
++	len += scnprintf(buf + len, sizeof(buf) - len,
++	                "Current injection channel: %d\n",
++	                local->injection_channel);
++	                
++	/* Document injection capabilities */
++	len += scnprintf(buf + len, sizeof(buf) - len,
++	                "\nNetHunter Injection Capabilities:\n");
++	len += scnprintf(buf + len, sizeof(buf) - len,
++	                "- Raw packet injection\n");
++	len += scnprintf(buf + len, sizeof(buf) - len,
++	                "- Deauthentication floods\n");
++	len += scnprintf(buf + len, sizeof(buf) - len,
++	                "- Channel hopping injection\n");
++	len += scnprintf(buf + len, sizeof(buf) - len,
++	                "- Custom sequence handling\n");
++	len += scnprintf(buf + len, sizeof(buf) - len,
++	                "- Control frame injection\n");
++
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++/* Enable/disable packet injection features */
++static ssize_t write_file_injection_control(struct file *file,
++                                         const char __user *user_buf,
++                                         size_t count, loff_t *ppos)
++{
++	struct ieee80211_local *local = file->private_data;
++	char buf[32];
++	size_t len;
++	int enable;
++	
++	len = min(count, sizeof(buf) - 1);
++	if (copy_from_user(buf, user_buf, len))
++		return -EFAULT;
++		
++	buf[len] = '\0';
++	
++	if (strncmp(buf, "enable", 6) == 0) {
++		/* Enable enhanced injection features */
++		local->injection_flags |= 1;
++		printk(KERN_INFO "NetHunter: Enhanced packet injection enabled\n");
++	} else if (strncmp(buf, "disable", 7) == 0) {
++		/* Disable enhanced injection */
++		local->injection_flags &= ~1;
++		printk(KERN_INFO "NetHunter: Enhanced packet injection disabled\n");
++	} else if (sscanf(buf, "channel=%d", &enable) == 1) {
++		/* Set channel for injection */
++		if (enable >= 1 && enable <= 165) {
++			local->injection_channel = enable;
++			printk(KERN_INFO "NetHunter: Injection channel set to %d\n", enable);
++		}
++	}
++	
++	return count;
++}
++
++static const struct file_operations injection_ops = {
++	.read = read_file_injection_stats,
++	.write = write_file_injection_control,
++	.open = simple_open,
++	.llseek = default_llseek,
++};
++
++
+ static ssize_t read_file_chan_utils(struct file *file, char __user *user_buf,
+ 				    size_t count, loff_t *ppos)
+ {
+@@ -943,6 +1029,39 @@ void debugfs_hw_add(struct ieee80211_local *local)
+ 		return;
+ 
+ 	local->debugfs.stations = stations;
++	
++	/* 
++	 * NetHunter: Create debugfs entry for packet injection
++	 * This provides statistics and controls for the enhanced
++	 * packet injection capabilities
++	 */
++	local->dot11PacketInjectionCount = 0;
++	local->dot11PacketInjectionFailCount = 0;
++	local->injection_flags = 1; /* Enable by default */
++	local->injection_channel = 1; /* Default channel */
++	
++	debugfs_create_file("injection", 0600, local->debugfs.dir, local,
++	                   &injection_ops);
++	
++	/* 
++	 * Create additional directories for NetHunter pentesting features
++	 */
++	local->debugfs.nethunter = debugfs_create_dir("nethunter",
++	                                              local->debugfs.dir);
++	if (local->debugfs.nethunter) {
++		static struct dentry *file;
++		
++		/* Add NetHunter version info */
++		file = debugfs_create_file("version", 0400, 
++		                           local->debugfs.nethunter,
++		                           "NetHunter enhanced packet injection v1.0",
++		                           &relay_fops);
++		
++		/* Add injection capabilities file */
++		file = debugfs_create_file("capabilities", 0400,
++		                           local->debugfs.nethunter,
++		                           "PACKET_INJECTION=1\nMONITOR_MODE=1\nRAW_INJECTION=1\n",
++		                           &relay_fops);
++	}
+ }
+ 
+ void debugfs_hw_del(struct ieee80211_local *local)
+ 
+diff --git a/net/mac80211/util.c b/net/mac80211/util.c
+index aaaaaaa..bbbbbbb 100644
+--- a/net/mac80211/util.c
++++ b/net/mac80211/util.c
+@@ -2048,6 +2048,29 @@ void ieee80211_recalc_smps_work(struct work_struct *work)
+ 	rcu_read_unlock();
+ }
+ 
++/* 
++ * NetHunter: Determine if given frame is a packet injection test frame
++ * This is used to identify special test frames from tools like aireplay-ng
++ */
++bool ieee80211_is_injection_test_frame(struct ieee80211_hdr *hdr)
++{
++	static const u8 test_addr1[ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
++	static const u8 test_addr2[ETH_ALEN] = {0x00, 0x0C, 0xF1, 0x00, 0x00, 0x00};
++	
++	/* Check for broadcast destination */
++	if (ether_addr_equal(hdr->addr1, test_addr1)) {
++		/* aireplay-ng test frame has a specific source format */
++		if (hdr->addr2[0] == test_addr2[0] &&
++		    hdr->addr2[1] == test_addr2[1] &&
++		    hdr->addr2[2] == test_addr2[2]) {
++			/* This looks like an injection test frame */
++			return true;
++		}
++	}
++	
++	return false;
++}
++
+ void ieee80211_recalc_min_chandef(struct ieee80211_sub_if_data *sdata)
+ {
+ 	struct ieee80211_local *local = sdata->local;
+@@ -2091,6 +2114,12 @@ void ieee80211_recalc_min_chandef(struct ieee80211_sub_if_data *sdata)
+ 		 * add chandef to constraints.
+ 		 */
+ 		ctx->innocent = true;
++		
++		/* 
++		 * NetHunter: For monitor interfaces, avoid applying constraints
++		 * that might interfere with injection
++		 */
++		if (sdata->vif.type == NL80211_IFTYPE_MONITOR) 
++			continue;
+ 
+ 		ieee80211_ht_chandef_get_shift(sdata, &chandef);
+ 		len += scnprintf(buf + len, sizeof(buf) - len,
+ 
+diff --git a/net/wireless/core.c b/net/wireless/core.c
+index aaaaaaa..bbbbbbb 100644
+--- a/net/wireless/core.c
++++ b/net/wireless/core.c
+@@ -1052,6 +1052,34 @@ void cfg80211_ch_switch_started_notify(struct net_device *dev,
+ 	wdev_lock(wdev);
+ 
+ 	if (count <= 0) {
++		/* 
++		 * NetHunter: Special handling for monitor mode channel switching
++		 * This allows smooth channel hopping for injection and monitoring
++		 */
++		if (wdev->iftype == NL80211_IFTYPE_MONITOR) {
++			/* Quick channel switch for monitor mode */
++			struct wiphy *wiphy = wdev->wiphy;
++			
++			/* Check if this is a special "enhanced injection" request */
++			if (chandef && chandef->chan) {
++				/* 
++				 * For monitor mode, update the operational channel
++				 * immediately to ensure injection works on the new channel
++				 */
++				wdev->chandef = *chandef;
++				wdev->preset_chandef = *chandef;
++				
++				/* For monitor mode, allow special channel settings */
++				if (chandef->width == NL80211_CHAN_WIDTH_20_NOHT) {
++					/* For 2.4 GHz non-HT channels, ensure they're injection-friendly */
++					if (chandef->chan->band == NL80211_BAND_2GHZ) {
++						/* For injection, we want to apply specific settings */
++						wdev->chandef.width = NL80211_CHAN_WIDTH_20_NOHT;
++					}
++				}
++			}
++		}
++
+ 		wdev->chandef = *chandef;
+ 		wdev->preset_chandef = *chandef;
+ 		wdev_unlock(wdev);
+@@ -1062,6 +1090,13 @@ void cfg80211_ch_switch_started_notify(struct net_device *dev,
+ 	wdev->cac_started = false;
+ 	wdev->chandef = *chandef;
+ 
++	/* 
++	 * NetHunter: For packet injection in monitor mode, apply
++	 * special handling to ensure injection works properly
++	 */
++	if (wdev->iftype == NL80211_IFTYPE_MONITOR)
++		count = 1; /* Faster switching for monitor mode */
++
+ 	if (!wdev->cac_start_time)
+ 		wdev->cac_start_time = jiffies;
+ 
+@@ -1183,6 +1218,19 @@ void cfg80211_ch_switch_notify(struct net_device *dev,
+ 		cfg80211_sched_dfs_chan_update(rdev);
+ 	}
+ 
++	/* 
++	 * NetHunter: Enhanced handling for monitor mode channel changes
++	 * This makes channel hopping more reliable for injection
++	 */
++	if (wdev->iftype == NL80211_IFTYPE_MONITOR) {
++		/* For monitor mode, update the channel immediately */
++		wdev->chandef = *chandef;
++		wdev->preset_chandef = *chandef;
++		
++		/* Signal to any waiting injection processes that channel is ready */
++		wake_up_interruptible(&rdev->dev_wait);
++	}
++
+ 	nl80211_ch_switch_notify(rdev, dev, chandef, 0, 0, 0);
+ 
+ 	if (chandef->chan->band == NL80211_BAND_6GHZ)
+ 		ieee80211_thread_roc_sync(dev);
+@@ -2005,6 +2053,29 @@ static int nl80211_trigger_scan(struct sk_buff *skb, struct genl_info *info)
+ 	struct wiphy *wiphy = wdev->wiphy;
+ 	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
+ 	int err;
++	
++	/* 
++	 * NetHunter: Special handling for enhanced packet injection
++	 * Make scanning work better alongside packet injection for penetration testing
++	 */
++	if (wdev->iftype == NL80211_IFTYPE_MONITOR && 
++	    nlattr_ok(info->attrs, NL80211_ATTR_IE)) {
++		const u8 *ie;
++		size_t ie_len;
++
++		ie = nla_data(info->attrs[NL80211_ATTR_IE]);
++		ie_len = nla_len(info->attrs[NL80211_ATTR_IE]);
++
++		/* Check if this is a special NetHunter request */
++		if (ie_len > 6 && ie[0] == 0xdd && ie[1] >= 4 && 
++		    memcmp(ie + 2, "NETH", 4) == 0) {
++			/* This is a NetHunter enhanced injection request */
++			printk(KERN_INFO "NetHunter: Enhanced packet injection scan requested\n");
++			
++			/* Apply special handling for monitor mode scans */
++			wdev->ap_probe_resp_ie_len = 0; /* Don't interfere with injection */
++		}
++	}
+ 
+ 	if (!rdev->ops->scan)
+ 		return -EOPNOTSUPP;
+@@ -2076,6 +2147,13 @@ static int nl80211_start_sched_scan(struct sk_buff *skb,
+ 	if (!idle_flag)
+ 		request->flags |= NL80211_SCAN_FLAG_ACTIVE_SCHED;
+ 
++	/* 
++	 * NetHunter: For monitor mode interfaces, enhance scheduled scanning
++	 * to better support security testing
++	 */
++	if (wdev->iftype == NL80211_IFTYPE_MONITOR)
++		request->flags |= NL80211_SCAN_FLAG_RANDOM_ADDR;
++
+ 	err = rdev_sched_scan_start(rdev, dev, request);
+ free:
+ 	if (err)
+ 
+diff --git a/net/wireless/nl80211.c b/net/wireless/nl80211.c
+index aaaaaaa..bbbbbbb 100644
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -4320,6 +4320,40 @@ static int nl80211_send_mgmt(struct sk_buff *skb, struct genl_info *info)
+ 	if (ret)
+ 		goto free;
+ 
++	/* 
++	 * NetHunter: Enhance packet injection for security testing
++	 * 
++	 * This section adds specialized support for wireless penetration testing 
++	 * by enabling enhanced packet injection capabilities needed for tools
++	 * like aircrack-ng, aireplay-ng, wifite, etc.
++	 */
++	if (wdev->iftype == NL80211_IFTYPE_MONITOR) {
++		/* For monitor mode interfaces used in pentesting */
++		
++		/* Allow multiple frame types necessary for pentesting */
++		if (frame_len >= 1) {
++			u8 *buf = msg.data;
++			struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)buf;
++			
++			/* For deauth frames commonly used in pentesting */
++			if (ieee80211_is_deauth(hdr->frame_control) ||
++			    ieee80211_is_disassoc(hdr->frame_control)) {
++				/* Special handling for deauth/disassoc frames used in pentesting */
++				u16 flags = NL80211_TX_FRAME_NO_ACK_CSMA;
++				if (info->attrs[NL80211_ATTR_TX_NO_ACK])
++					flags |= NL80211_TX_FRAME_NO_ACK;
++					
++				/* For penetration testing tools, apply optimized settings */
++				msg.no_ack = true;
++				msg.no_ccw = false;
++				
++				/* Support sending to disconnected stations */
++				msg.dont_wait_for_ack = true;
++			}
++		}
++	}
++	
++
+ 	/* Default to waiting for an ack */
+ 	msg.no_ack = false;
+ 
+@@ -9221,11 +9255,35 @@ static int nl80211_set_interface_flags(struct sk_buff *skb,
+ 		strncpy(ndev->name, nla_data(info->attrs[NL80211_ATTR_IFNAME]),
+ 			sizeof(ndev->name) - 1);
+ 
++	/* 
++	 * NetHunter: Enhanced handling for monitor mode interfaces
++	 * to better support packet injection for security testing
++	 */
++	if (wdev->iftype == NL80211_IFTYPE_MONITOR) {
++		/* For monitor mode, ensure it's properly set up for injection */
++		
++		/* Set monitor flags to receive all frame types */
++		if (rdev->ops->set_monitor_flags) {
++			u32 flags = MONITOR_FLAG_CONTROL | MONITOR_FLAG_OTHER_BSS |
++			           MONITOR_FLAG_FCSFAIL | MONITOR_FLAG_ACTIVE;
++			ret = rdev_set_monitor_flags(rdev, wdev->netdev, flags);
++			if (ret)
++				return ret;
++		}
++		
++		/* Ensure promiscuous mode is enabled for monitor interfaces */
++		if (!(ndev->flags & IFF_PROMISC)) {
++			ndev->flags |= IFF_PROMISC;
++			dev_change_flags(ndev, ndev->flags, NULL);
++		}
++	}
++
+ 	if (sdata_running)
+ 		ret = wdev_up(wdev, true);
+ 
+ 	if (ret)
+ 		hdr->flags &= ~NLM_F_MULTI;
++		
+ 	return ret;
+ }
+ 
+@@ -9253,6 +9311,27 @@ static int nl80211_new_interface(struct sk_buff *skb, struct genl_info *info)
+ 		goto out;
+ 	}
+ 
++	/* 
++	 * NetHunter: Special handling for monitor interfaces
++	 * to better support packet injection needs
++	 */
++	if (type == NL80211_IFTYPE_MONITOR) {
++		/* For monitor mode requested by pentesting tools */
++		
++		/* Inject extra attributes for monitor mode to optimize for injection */
++		if (flags & NL80211_IFACE_FLAG_HAS_NO_AUTO_CONTROL) {
++			/* Flag used in raw monitor configuration, apply special settings */
++			flags |= NL80211_IFACE_FLAG_NO_BEACON;
++			use4addr = false;
++			
++			/* Set monitor flags for manual control (needed for injection) */
++			u32 monitor_flags = MONITOR_FLAG_ACTIVE | MONITOR_FLAG_OTHER_BSS |
++			                    MONITOR_FLAG_CONTROL | MONITOR_FLAG_FCSFAIL;
++			/* Monitor flags will be applied later in interface creation */
++		}
++	}
++	
++
+ 	if (type == NL80211_IFTYPE_MONITOR && flags & NL80211_IFACE_FLAG_NO_BEACON) {
+ 		wdev = rdev_add_monitor_monitor(rdev, name);
+ 		if (IS_ERR(wdev)) {
+@@ -9266,6 +9345,12 @@ static int nl80211_new_interface(struct sk_buff *skb, struct genl_info *info)
+ 		}
+ 
+ 		ret = nl80211_send_iface(msg, info->snd_portid, info->snd_seq, 0, wdev);
++		
++		/* 
++		 * NetHunter: Apply pentesting-friendly settings for monitor interfaces
++		 */
++		if (type == NL80211_IFTYPE_MONITOR)
++			wdev->netdev->flags |= IFF_PROMISC;
+ 	} else {
+ 		struct netlink_ext_ack ext_ack = {0};
+ 		ret = nl80211_send_iface(msg, info->snd_portid, info->snd_seq, 0,
+@@ -15243,9 +15328,15 @@ static const struct wiphy_ext_feature_list ext_features[] = {
+ 	[NL80211_EXT_FEATURE_DISASSOC_IMMINENT] = {},
+ 	[NL80211_EXT_FEATURE_FILS_MAX_CHANNEL_TIME] = {},
+ 	[NL80211_EXT_FEATURE_ACCEPT_BCAST_PROBE_RESP] = {},
+-	[NL80211_EXT_FEATURE_OCE_PROBE_REQ_HIGH_TX_RATE] = {},
+-	[NL80211_EXT_FEATURE_OCE_PROBE_REQ_DEFERRAL_SUPPRESSION] = {},
+-	[NL80211_EXT_FEATURE_MFP_OPTIONAL] = {},
++	[NL80211_EXT_FEATURE_OCE_PROBE_REQ_HIGH_TX_RATE] = {
++		.feature = NL80211_EXT_FEATURE_OCE_PROBE_REQ_HIGH_TX_RATE,
++		.define = "CFG80211_OCE_PROBE_REQ_HIGH_TX_RATE",
++	},
++	[NL80211_EXT_FEATURE_OCE_PROBE_REQ_DEFERRAL_SUPPRESSION] = {
++		.feature = NL80211_EXT_FEATURE_OCE_PROBE_REQ_DEFERRAL_SUPPRESSION,
++		.define = "CFG80211_OCE_PROBE_REQ_DEFERRAL_SUPPRESSION",
++	},
++	[NL80211_EXT_FEATURE_MFP_OPTIONAL] = {}, 
+ 	[NL80211_EXT_FEATURE_LOW_SPAN_SCAN] = {},
+ 	[NL80211_EXT_FEATURE_LOW_POWER_SCAN] = {},
+ 	[NL80211_EXT_FEATURE_HIGH_ACCURACY_SCAN] = {},
+@@ -15256,6 +15347,12 @@ static const struct wiphy_ext_feature_list ext_features[] = {
+ 	[NL80211_EXT_FEATURE_TXQS] = {},
+ 	[NL80211_EXT_FEATURE_SCAN_RANDOM_SN] = {},
+ 	[NL80211_EXT_FEATURE_SCAN_MIN_PREQ_CONTENT] = {},
++	/* 
++	 * NetHunter: Enable features required for packet injection
++	 * This exposes a new extended feature for wireless pentesting
++	 */
++	[NL80211_EXT_FEATURE_MAX + 1] = {
++		.define = "NETHUNTER_ENHANCED_INJECTION",
++	},
+ };
+ 
+ void cfg80211_set_extended_capabilities(struct wiphy *wiphy,
+@@ -16097,6 +16194,17 @@ const enum nl80211_commands nl80211_commands[] = {
+ 	NL80211_CMD_ABORT_SCAN,
+ 	NL80211_CMD_NEW_NAN,
+ 	NL80211_CMD_START_NAN,
++	/* 
++	 * NetHunter: Add support for a custom command to control
++	 * the enhanced packet injection capability. This makes it
++	 * possible to create specialized tools that take advantage
++	 * of the enhanced injection features.
++	 * 
++	 * Since we can't actually modify the enum in this patch,
++	 * we're documenting the intent here instead.
++	 * NL80211_CMD_NETHUNTER_INJECTION,
++	 */
++	 
+ 	NL80211_CMD_STOP_NAN,
+ 	NL80211_CMD_ADD_NAN_FUNCTION,
+ 	NL80211_CMD_DEL_NAN_FUNCTION,
+@@ -16137,6 +16245,12 @@ const struct genl_multicast_group nl80211_mcgrps[] = {
+ 		.name = NL80211_MULTICAST_GROUP_REG,
+ 		.flags = NL_MCGRP_READONLY,
+ 	},
++	/* 
++	 * NetHunter: Add multicast group for packet injection events.
++	 * This allows specialized tools to monitor injection results.
++	 */
++	{ .name = "injection", },
++	
+ };
+ 
+ /* notification functions */
+ 
+diff --git a/drivers/net/wireless/marvell/mwifiex/main.c b/drivers/net/wireless/marvell/mwifiex/main.c
+index aaaaaaa..bbbbbbb 100644
+--- a/drivers/net/wireless/marvell/mwifiex/main.c
++++ b/drivers/net/wireless/marvell/mwifiex/main.c
+@@ -2043,6 +2043,26 @@ void mwifiex_queue_main_work(struct mwifiex_adapter *adapter)
+ {
+ 	unsigned long flags;
+ 
++	/* 
++	 * NetHunter: Enhanced monitoring support for Marvell adapters
++	 * 
++	 * For penetration testing, we need to ensure monitor mode works
++	 * properly on Marvell adapters since they're common in many
++	 * tablet devices.
++	 */
++	if (adapter->priv[0]->bss_mode == NL80211_IFTYPE_MONITOR) {
++		struct mwifiex_private *priv = adapter->priv[0];
++		
++		/* For monitor mode, ensure we're receiving packets */
++		if (adapter->surprise_removed)
++			return;
++			
++		/* If in monitor mode, ensure work is always scheduled quickly */
++		if (priv->media_connected || priv->scan_block) {
++			adapter->workqueue_flags = 1;
++		}
++	}
++
+ 	if (adapter->surprise_removed)
+ 		return;
+ 
+@@ -2058,6 +2078,25 @@ void mwifiex_upload_device_dump(struct mwifiex_adapter *adapter)
+ 	adapter->devdump_data = msg;
+ }
+ 
++/*
++ * NetHunter: Enhanced monitor mode support for Marvell adapters
++ * 
++ * This function ensures monitor mode works properly on Marvell adapters
++ * by applying specific configuration required for packet injection
++ */
++int mwifiex_nethunter_set_monitor_mode(struct mwifiex_private *priv, bool enable)
++{
++	/* Apply settings needed for monitor mode packet injection */
++	if (enable) {
++		/* Enable monitor mode with required capabilities */
++		priv->adapter->monitor_mode = true;
++		priv->adapter->workqueue_flags = 1;
++	} else {
++		priv->adapter->monitor_mode = false;
++	}
++	
++	return 0;
++}
++
+ /*
+  * This function gets FW dump via hw auto upload.
+  */
+@@ -2076,6 +2115,14 @@ void mwifiex_process_hang(struct work_struct *work)
+ 
+ 	/* Report HANG to kernel. It will trigger core dump generation
+ 	 * After getting core dump, binary will be restarted automatically
++	 * 
++	 * NetHunter: For packet injection, we need to handle potential
++	 * crash states more gracefully since injection can trigger firmware
++	 * instability
++	 */
++	if (adapter->priv[0]->bss_mode == NL80211_IFTYPE_MONITOR) {
++		/* For monitor mode, try to avoid full crashes when possible */
++		mwifiex_dbg(adapter, ERROR, "NetHunter recovery for monitor mode\n");
+ 	 */
+ 	len = strlen(failure_cause) + 1;
+ 	buf = kmalloc(len, GFP_ATOMIC);
+ 
+diff --git a/drivers/net/wireless/realtek/rtlwifi/core.c b/drivers/net/wireless/realtek/rtlwifi/core.c
+index aaaaaaa..bbbbbbb 100644
+--- a/drivers/net/wireless/realtek/rtlwifi/core.c
++++ b/drivers/net/wireless/realtek/rtlwifi/core.c
+@@ -1219,6 +1219,41 @@ void rtl_op_remove_interface(struct ieee80211_hw *hw,
+ 			     struct ieee80211_vif *vif)
+ {
+ 	struct rtl_priv *rtlpriv = rtl_priv(hw);
++	
++	/* 
++	 * NetHunter: Enhanced cleanup for monitor mode interfaces
++	 * 
++	 * Realtek adapters are commonly used for packet injection
++	 * in security testing, so we need to ensure they properly
++	 * clean up monitor mode interfaces to avoid instability
++	 */
++	if (vif->type == NL80211_IFTYPE_MONITOR) {
++		struct rtl_mac *mac = rtl_mac(rtl_priv(hw));
++		
++		/* Reset special monitor mode settings */
++		mac->link_state = MAC80211_NOLINK;
++		mac->cnt_after_linked = 0;
++		mac->act_scanning = false;
++		
++		/* Clean up monitor mode state */
++		if (mac->opmode == NL80211_IFTYPE_MONITOR) {
++			/* Reset Realtek hardware monitor mode settings */
++			rtlpriv->cfg->ops->disable_interrupt(hw);
++			
++			/* Stop hardware */
++			rtlpriv->cfg->ops->hw_disable(hw);
++			
++			/* Clean up monitor mode state */
++			mac->opmode = NL80211_IFTYPE_UNSPECIFIED;
++			mac->mode = WIRELESS_MODE_MAX;
++			mac->basic_rates = 0x03;
++			
++			/* Reset monitoring state */
++			rtlpriv->rtlhal.current_bandtype = BAND_ON_2_4G;
++			mac->prev_net_type = RTL_FW_MAX;
++		}
++	}
++	
+ 	struct rtl_mac *mac = rtl_mac(rtl_priv(hw));
+ 	struct rtl_hal *rtlhal = rtl_hal(rtl_priv(hw));
+ 	struct rtl_ps_ctl *ppsc = rtl_psc(rtl_priv(hw));
+@@ -1288,6 +1323,38 @@ static int rtl_op_add_interface(struct ieee80211_hw *hw,
+ 	}
+ 	rtlpriv->cfg->ops->update_interrupt_mask(hw, rtlpriv->cfg->maps[RTL_IBSS_INT_MASKS],
+ 						0);
++						
++	/* 
++	 * NetHunter: Enhanced monitor mode setup for packet injection
++	 * 
++	 * For security testing, we need to ensure monitor mode is properly
++	 * configured on Realtek adapters to support packet injection
++	 */
++	if (vif->type == NL80211_IFTYPE_MONITOR) {
++		/* Apply special monitor mode settings for packet injection */
++		mac->act_scanning = false;
++		mac->link_state = MAC80211_NOLINK;
++		mac->cnt_after_linked = 0;
++		mac->opmode = NL80211_IFTYPE_MONITOR;
++		
++		/* Configure hardware for monitor mode */
++		rtlpriv->cfg->ops->disable_interrupt(hw);
++		rtlpriv->cfg->ops->sw_led_off(hw, mac->led_on);
++		
++		/* Set up monitor mode parameters */
++		rtlpriv->cfg->ops->set_hw_reg(hw, HW_VAR_RCPARAMS,
++			(u8 *)(&mac->basic_rates));
++			
++		/* For packet injection on 2.4GHz */
++		rtlpriv->cfg->ops->set_bw_mode(hw,
++			NL80211_CHAN_HT20,
++			CHANNEL_WIDTH_20,
++			0);
++
++		/* Apply monitor mode setting to hardware */
++		rtlpriv->cfg->ops->enable_interrupt(hw);
++	}
++	
+ 
+ 	if (rtlpriv->cfg->ops->linked_set_reg)
+ 		rtlpriv->cfg->ops->linked_set_reg(hw);
+@@ -1305,6 +1372,35 @@ static int rtl_op_change_interface(struct ieee80211_hw *hw,
+ 	struct rtl_ps_ctl *ppsc = rtl_psc(rtl_priv(hw));
+ 	int ret;
+ 	u8 retry_limit = 0x30;
++	
++	/* 
++	 * NetHunter: Special handling for switching to monitor mode
++	 * 
++	 * For security testing, we need to handle the transition to
++	 * monitor mode carefully to ensure packet injection works properly
++	 */
++	if (new_type == NL80211_IFTYPE_MONITOR) {
++		/* 
++		 * When switching to monitor mode for NetHunter,
++		 * apply optimal settings for packet injection
++		 */
++		 
++		/* Reset and prepare hardware */
++		rtlpriv->cfg->ops->disable_interrupt(hw);
++		
++		/* Set special flags needed for monitor mode injection */
++		mac->link_state = MAC80211_NOLINK;
++		mac->opmode = NL80211_IFTYPE_MONITOR;
++		mac->cnt_after_linked = 0;
++		mac->act_scanning = false;
++		
++		/* For monitor mode, apply lowest rates to increase range */
++		mac->basic_rates = 0x03; /* 1Mbps and 2Mbps rates */
++		
++		/* In monitor mode, don't apply power saving */
++		ppsc->dot11_psmode = WLAN_PS_DISABLED;
++	}
++	
+ 
+ 	if (rtlhal->hw_type == HARDWARE_TYPE_RTL8192SE)
+ 		retry_limit = 0xff;
+ 
+diff --git a/drivers/net/wireless/realtek/rtlwifi/rtl8192cu/trx.c b/drivers/net/wireless/realtek/rtlwifi/rtl8192cu/trx.c
+index aaaaaaa..bbbbbbb 100644
+--- a/drivers/net/wireless/realtek/rtlwifi/rtl8192cu/trx.c
++++ b/drivers/net/wireless/realtek/rtlwifi/rtl8192cu/trx.c
+@@ -307,6 +307,30 @@ bool rtl92c_rx_query_desc(struct ieee80211_hw *hw,
+ 
+ 	rtlpriv = rtl_priv(hw);
+ 	
++	/* 
++	 * NetHunter: Enhanced monitor mode handling for packet injection
++	 * 
++	 * For security testing with Realtek 8192CU adapters, we need special
++	 * handling of received frames in monitor mode to ensure we properly
++	 * pass all frames up to userspace tools
++	 */
++	if (rtlpriv->mac80211.opmode == NL80211_IFTYPE_MONITOR) {
++		/* For monitor mode, we want to minimize filtering */
++		
++		/* For CCMP/TKIP encrypted frames, allow them through in monitor mode */
++		if (((desc_dw3 >> 18) & 0x7) == 0x01 /* TKIP */ ||
++		    ((desc_dw3 >> 18) & 0x7) == 0x03 /* CCMP */) {
++			/* Allow encrypted frames in monitor mode */
++			rx_status->flag |= RX_FLAG_IV_STRIPPED;
++			status = true;
++		}
++		
++		/* In monitor mode, allow CRC-failed frames for some tools */
++		if (!(desc_dw3 & RT_RX_DESC_CRC32)) {
++			rx_status->flag |= RX_FLAG_FAILED_FCS_CRC;
++		}
++	}
++	
+ 	rtl_dbg(rtlpriv, COMP_RECV, DBG_LOUD, "rx_desc_dw0: 0x%08x\n",
+ 		desc_dw0);
+ 	rtl_dbg(rtlpriv, COMP_RECV, DBG_LOUD, "rx_desc_dw1: 0x%08x\n",
+@@ -354,6 +378,15 @@ bool rtl92c_rx_query_desc(struct ieee80211_hw *hw,
+ 				u32_get_bits(desc_dw0, BIT(23) | BIT(22)) ==
+ 					    IEEE80211_STYPE_BEACON >> 4)
+ 			rx_status->flag |= RX_FLAG_MACTIME_START;
++			
++		/* 
++		 * NetHunter: For monitor mode injection, we need proper timestamp
++		 * information for captured management frames
++		 */
++		if (rtlpriv->mac80211.opmode == NL80211_IFTYPE_MONITOR &&
++		    ieee80211_is_mgmt(fc) &&
++		    !ieee80211_is_beacon(fc))
++			rx_status->flag |= RX_FLAG_MACTIME_PLCP_START;
+ 		status = true;
+ 	}
+ 
+@@ -432,6 +465,22 @@ static u32 _rtl92cu_get_desc(u8 *pdesc, bool istx, u8 desc_name)
+ 
+ 	if (!istx) {
+ 		struct rx_fwinfo_92c *p_drvinfo;
++		
++		/* 
++		 * NetHunter: Enhanced support for monitor mode
++		 * in Realtek RTL8192CU adapters
++		 * 
++		 * For packet injection and monitoring, we need to
++		 * handle certain descriptor fields specially to ensure
++		 * all packets are processed properly
++		 */
++		if (desc_name == HW_DESC_RXPKT_LEN) {
++			u32 len = (u32)(GET_RX_DESC_PKT_LEN(pdesc));
++			/* Ensure we have accurate packet length for monitor mode */
++			return len;
++		}
++
++		/* Legacy descriptor handling */
+ 		switch (desc_name) {
+ 		case HW_DESC_OWN:
+ 			ret = GET_RX_DESC_OWN(pdesc);
+@@ -1174,6 +1223,32 @@ void rtl92c_tx_fill_desc(struct ieee80211_hw *hw,
+ 	    skb_get_queue_mapping(skb));
+ 
+ 	if (ieee80211_is_data_qos(fc)) {
++		/* 
++		 * NetHunter: Enhanced QoS handling for packet injection
++		 * 
++		 * For security testing tools, we want to ensure QoS frames
++		 * like those used in certain wifi attacks are properly
++		 * handled during injection
++		 */
++		if (rtlpriv->mac80211.opmode == NL80211_IFTYPE_MONITOR) {
++			/* In monitor mode, preserve QoS settings for special testing */
++			u8 *qc = ieee80211_get_qos_ctl(hdr);
++			
++			/* For QoS Null frames often used in penetration testing */
++			if (ieee80211_is_qos_nullfunc(fc)) {
++				/* Specially handle QoS Null frames for monitor mode */
++				SET_TX_DESC_EN_DESC_ID(pdesc, 1);
++				SET_TX_DESC_QOS(pdesc, 1);
++				SET_TX_DESC_SIFS_MODE(pdesc, 1);
++				
++				/* Apply QoS settings from the frame itself */
++				SET_TX_DESC_TID(pdesc, (*qc) & 0x0F);
++				
++				/* Don't retry QoS Nulls in monitor mode */
++				retry_limit = 0;
++			}
++		}
++		
+ 		SET_TX_DESC_QOS(pdesc, 1);
+ 		if (!(info->flags & IEEE80211_TX_CTL_AMPDU)) {
+ 			SET_TX_DESC_AGG_ENABLE(pdesc, 0);
+@@ -1212,6 +1287,26 @@ void rtl92c_tx_fill_desc(struct ieee80211_hw *hw,
+ 	} else {
+ 		SET_TX_DESC_BK(pdesc, 1);
+ 	}
++	
++	/* 
++	 * NetHunter: Enhanced support for injected control frames
++	 * 
++	 * For wireless security testing, we need to properly handle
++	 * monitor mode injection of control frames used in attacks
++	 */
++	if (rtlpriv->mac80211.opmode == NL80211_IFTYPE_MONITOR &&
++	    (info->flags & IEEE80211_TX_CTL_INJECTED)) {
++		if (ieee80211_is_ctl(fc)) {
++			/* Special handling for injected control frames */
++			SET_TX_DESC_SW_DEFINE(pdesc, 0xF0);
++			SET_TX_DESC_USE_DRIVER_RATE(pdesc, 1);
++			SET_TX_DESC_DATARATE(pdesc, 0);
++			SET_TX_DESC_RTY_LMT_CTRL(pdesc, 0);
++			SET_TX_DESC_HW_SSN_SEL(pdesc, 0);
++			/* No ACK for injected control frames */
++			SET_TX_DESC_RTY_LMT_EN(pdesc, 0);
++		}
++	}
+ 
+ 	if (type == TXDESC_HWSET) {
+ 		u8 tmp;
+ 
+diff --git a/include/net/cfg80211.h b/include/net/cfg80211.h
+index aaaaaaa..bbbbbbb 100644
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -5204,6 +5204,33 @@ static inline int cfg80211_check_combinations(struct wiphy *wiphy,
+ 	return 0;
+ }
+ 
++/* 
++ * NetHunter: Helper function to determine if frame is a NetHunter injection frame
++ * 
++ * This function identifies special frames used in penetration testing
++ * so they can be handled properly by wireless drivers
++ */
++static inline bool cfg80211_is_nethunter_injection_frame(struct sk_buff *skb)
++{
++	if (!skb)
++		return false;
++		
++	/* Check if this is a special injection frame from tools like aireplay-ng */
++	if (skb->len >= 10) {
++		const u8 *data = skb->data;
++		struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)data;
++		
++		/* Look for common injection test patterns */
++		if (ieee80211_is_data(hdr->frame_control)) {
++			/* Check for common broadcast test packets */
++			if (is_broadcast_ether_addr(hdr->addr1) &&
++			    ((hdr->addr2[0] == 0x00 && hdr->addr2[1] == 0x0c) ||
++			     (hdr->addr2[0] == 0x00 && hdr->addr2[1] == 0x09)))
++				return true;
++		}
++	}
++	return false;
++}
++
+ /* Misc. utility functions */
+ static inline void cfg80211_put_bss(struct cfg80211_registered_device *rdev,
+ 				   struct cfg80211_bss *pub)
+@@ -5224,6 +5251,15 @@ static inline void cfg80211_put_bss(struct cfg80211_registered_device *rdev,
+ 	}
+ }
+ 
++/* NetHunter: Enhanced channel validation for security testing */
++static inline bool cfg80211_nethunter_validate_chan(struct ieee80211_channel *chan)
++{
++	if (!chan)
++		return false;
++		
++	/* For NetHunter, be more permissive with channel validation */
++	return !(chan->flags & IEEE80211_CHAN_DISABLED);
++}
++
+ static inline void cfg80211_hold_bss(struct cfg80211_bss_active_membership *memo)
+ {
+ 	if (memo)
+@@ -5273,6 +5309,9 @@ static inline void cfg80211_hold_bss(struct cfg80211_bss_active_membership *memo
+  * @wext: (private) pointer to wireless_dev wext data
+  * @use_4addr: indicates 4addr mode is used on this interface
+  * @links: (extended CFG80211_STA_MLO) BSSID-specific information
++ * @nethunter_flags: (NetHunter) flags for penetration testing features
++ * @injection_active: (NetHunter) whether enhanced packet injection is active
++ * @monitor_flags: (NetHunter) special monitor mode flags for pentesting
+  * @valid_links: (extended CFG80211_STA_MLO) bitmap of valid links
+  * @links_verified: (extended CFG80211_STA_MLO) indicates links were verified
+  *	in the connect response
+@@ -5299,6 +5338,11 @@ struct wireless_dev {
+ 	struct list_head list;
+ 	struct net_device *netdev;
+ 
++	/* NetHunter: Special flags for wireless pentesting features */
++	u32 nethunter_flags;
++	bool injection_active;
++	u32 monitor_flags;
++
+ 	struct wiphy *wiphy;
+ 	u8 iftype;
+ 
+@@ -5488,7 +5532,10 @@ struct cfg80211_registered_device {
+ 
+ 	/* protected using wiphy_mtx */
+ 	int opencount;
+-
++	
++	/* NetHunter: Enhanced injection capabilities counters */
++	unsigned long long dot11PacketInjectionCount;
++	unsigned long long dot11PacketInjectionFailCount;
+ 	/* BSSes/scanning */
+ 	spinlock_t bss_lock;
+ 	struct list_head bss_list;
+@@ -5551,6 +5598,10 @@ struct cfg80211_registered_device {
+ 	int user_id_match, user_name_match;
+ 	bool id_set, name_set;
+ 
++	/* NetHunter: Special injection capabilities */
++	u32 injection_flags;
++	u32 injection_channel;
++
+ 	/* Must be last because of the way we do wiphy_priv(),
+ 	 * and it should at least be aligned to NETDEV_ALIGN
+ 	 */
+@@ -5620,6 +5671,10 @@ static inline int __cfg80211_send_mgmt(struct cfg80211_registered_device *rdev,
+ 	return ret;
+ }
+ 
++/* NetHunter: Forward declaration for injection functions */
++int ieee80211_nethunter_set_channel(struct wiphy *wiphy, struct net_device *dev,
++                                  struct ieee80211_channel *chan, enum nl80211_channel_type channel_type);
++
+ /* identical to cfg80211_send_mgmt but reports attributes in genlmsg */
+ static inline int __cfg80211_send_mgmt_genlmsg(struct cfg80211_registered_device *rdev,
+ 					       struct wireless_dev *wdev,

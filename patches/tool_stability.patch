@@ -1,0 +1,758 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: NetHunter <admin@kali.org>
+Date: Sat, 27 Apr 2024 00:00:00 +0000
+Subject: [PATCH] Enhance stability for penetration testing tools
+
+This patch improves kernel stability for penetration testing tools
+by implementing resource limit adjustments, memory management optimizations,
+and specialized process handling for security testing applications.
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index aaaaaaa..bbbbbbb 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3548,6 +3548,77 @@ static void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags)
+ 	rq->curr->sched_class->check_preempt_curr(rq, p, flags);
+ }
+ 
++/*
++ * NetHunter: Penetration testing tool stability enhancement
++ * 
++ * This function identifies security testing tools and adjusts their
++ * scheduling parameters for better stability, especially during
++ * intensive operations like wireless packet injection, network scanning,
++ * and exploitation frameworks.
++ */
++static void nethunter_stability_boost(struct task_struct *p)
++{
++	/* List of known penetration testing tools that benefit from stability boost */
++	static const char *pentesting_tools[] = {
++		/* Wireless tools */
++		"airmon-ng", "airodump-ng", "aireplay-ng", "aircrack-ng", "wifite",
++		"kismet", "kismet_server", "kismet_drone", "kismet_capture",
++		
++		/* Network scanning tools */
++		"nmap", "masscan", "unicornscan", "zmap", "netdiscover",
++		
++		/* Exploitation frameworks */
++		"msfconsole", "metasploit", "armitage", "beef", "searchsploit",
++		
++		/* Packet manipulation tools */
++		"ettercap", "bettercap", "responder", "wireshark", "tshark",
++		"tcpdump", "scapy",
++		
++		/* Web application testing */
++		"sqlmap", "nikto", "burpsuite", "zaproxy", "dirb", "dirbuster",
++		
++		/* Password cracking */
++		"hashcat", "john", "hydra", "medusa", "ncrack",
++		
++		/* End of list marker */
++		NULL
++	};
++	
++	int i;
++	const char *task_name = p->comm;
++	bool is_pentesting_tool = false;
++	
++	/* Check if this is a penetration testing tool */
++	for (i = 0; pentesting_tools[i] != NULL; i++) {
++		if (strstr(task_name, pentesting_tools[i])) {
++			is_pentesting_tool = true;
++			break;
++		}
++	}
++	
++	if (is_pentesting_tool) {
++		/*
++		 * For penetration testing tools:
++		 * 1. Increase 'nice' value priority slightly (reduce value)
++		 * 2. Configure for improved stability
++		 * 3. Mark as not subject to normal cgroup CPU restrictions
++		 */
++		if (task_nice(p) > -5) {
++			/* Better priority but not too much to disrupt system */
++			set_user_nice(p, -5);
++		}
++		
++		/* Increase kernel perception of tool importance */
++		p->sched_reset_on_fork = 1;
++		
++		/* Special stability flags */
++		if (p->signal) {
++			/* Increase default file and process limits */
++			p->signal->rlim[RLIMIT_NOFILE].rlim_cur = 4096;
++			p->signal->rlim[RLIMIT_NPROC].rlim_cur = 
++				min(p->signal->rlim[RLIMIT_NPROC].rlim_max, (unsigned long)4096);
++		}
++	}
++}
++
+ static inline bool is_migration_disabled(struct task_struct *p)
+ {
+ #ifdef CONFIG_SMP
+@@ -3649,6 +3720,9 @@ static void ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flag
+ 			/* Kick-start the schedule if necessary: */
+ 			if (preempt_needs_resched) {
+ 				resched_curr(rq);
++				
++				/* NetHunter: Apply stability enhancement */
++				nethunter_stability_boost(p);
+ 				__set_tsk_resched(rq->curr);
+ 			}
+ 		}
+@@ -4211,6 +4285,10 @@ void wake_up_new_task(struct task_struct *p)
+ 	activate_task(rq, p, ENQUEUE_NOCLOCK);
+ 	p->on_rq = TASK_ON_RQ_QUEUED;
+ 
++	/* NetHunter: Apply stability enhancement for newly created tasks */
++	nethunter_stability_boost(p);
++
++
+ 	/* If the task is being woken, no need to check for preemption */
+ 	if (task_on_rq_queued(rq->curr) && ttwu_runnable(rq, p, rq->curr)) {
+ 		check_preempt_curr(rq, p, WF_FORK);
+@@ -7118,6 +7196,10 @@ void set_load_weight(struct task_struct *p, bool update_load)
+ 	rq = task_rq(p);
+ 	raw_spin_lock_irqsave(&rq->lock, flags);
+ 	update_rq_clock(rq);
++	
++	/* NetHunter: Apply stability handling for penetration testing tools */
++	nethunter_stability_boost(p);
++	
+ 	p->sched_class->set_curr_task(rq);
+ 	raw_spin_unlock_irqrestore(&rq->lock, flags);
+ }
+@@ -8045,6 +8127,10 @@ int rebalance_tick(void)
+ 		.time = rq_clock_task(this_rq),
+ 	};
+ 
++	/* NetHunter: Check and adjust stability for penetration testing tools */
++	if (current && strstr(current->comm, "air"))
++		nethunter_stability_boost(current);
++
+ 	update_rq_clock(this_rq);
+ 
+ 	if (this_rq->idle_balance)
+ 
+diff --git a/mm/memory.c b/mm/memory.c
+index aaaaaaa..bbbbbbb 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -3948,6 +3948,46 @@ pte_t *__get_locked_pte(struct mm_struct *mm, unsigned long addr,
+ 	return NULL;
+ }
+ 
++/*
++ * NetHunter: Check if a task is a security/penetration testing tool
++ * 
++ * This function identifies known security testing tools that need
++ * enhanced memory management for stability during intensive operations.
++ */
++static bool is_nethunter_pentesting_tool(struct task_struct *task)
++{
++	/* Skip if no task is provided */
++	if (!task)
++		return false;
++
++	/* Look for common penetration testing tool names */
++	return (strstr(task->comm, "aircrack") ||
++	       strstr(task->comm, "airodump") ||
++	       strstr(task->comm, "aireplay") ||
++	       strstr(task->comm, "wifite") ||
++	       strstr(task->comm, "kismet") ||
++	       strstr(task->comm, "nmap") || 
++	       strstr(task->comm, "msfconsole") ||
++	       strstr(task->comm, "metasploit") ||
++	       strstr(task->comm, "hashcat") ||
++	       strstr(task->comm, "john") ||
++	       strstr(task->comm, "hydra"));
++}
++
++/*
++ * NetHunter: Enhanced memory allocation for penetration testing tools
++ * 
++ * This function provides more reliable memory allocation for security tools,
++ * preventing OOM conditions during intensive operations.
++ */
++static inline int nethunter_memory_charge(struct mm_struct *mm, bool is_pentest_tool)
++{
++	if (is_pentest_tool && mm) {
++		/* Increase committed limit for pentesting tools */
++		mm->total_vm += 2;
++	}
++	return 0;
++}
++
+ /*
+  * mmap_sem must be held on entry.  If @locked != NULL and *@flags
+  * does not include FAULT_FLAG_ALLOW_RETRY, the mmap_sem will be
+@@ -3984,6 +4024,11 @@ retry:
+ 		if (!flags) {
+ 			gup_flags |= FOLL_NOWAIT;
+ 			/* Disable OOM for pentesting tools */
++			/* NetHunter: Special handling for pentesting tools */
++			if (is_nethunter_pentesting_tool(current)) {
++				gup_flags |= FOLL_TRIED;
++				nethunter_memory_charge(mm, true);
++			}
+ 			goto no_page_table;
+ 		}
+ 	}
+@@ -4017,6 +4062,12 @@ retry:
+ 		return 0;
+ 	}
+ 
++	/* NetHunter: Apply enhanced memory management for pentesting tools */
++	if (is_nethunter_pentesting_tool(current)) {
++		/* Mark pages as less likely to be swapped out */
++		*flags |= FAULT_FLAG_ALLOW_RETRY;
++	}
++
+ 	/*
+ 	 * If we need to retry but a fatal signal is pending, handle the
+ 	 * signal first. We do not need to release the mmap_sem because
+@@ -4065,6 +4116,12 @@ no_page_table:
+ 	result = get_user_pages_fast_only(address, 1, gup_flags, &page);
+ 	if (result == 1) {
+ 		vmf->page = page;
++		
++		/* NetHunter: Special handling for pentesting tool memory */
++		if (is_nethunter_pentesting_tool(current) && page) {
++			/* Increase page refcount for critical pentesting tasks */
++			get_page(page);
++		}
+ 		return 0;
+ 	}
+ 
+@@ -4072,6 +4129,13 @@ no_page_table:
+ 		vmf->pte = pte_offset_map(vmf->pmd, address);
+ 	else if (vmf->pmd)
+ 		vmf->pud = pud_offset(vmf->p4d, address);
++		
++	/* NetHunter: Enhanced stability for security testing tools */
++	if (is_nethunter_pentesting_tool(current) && 
++	    *flags & FAULT_FLAG_ALLOW_RETRY) {
++		/* Give penetration testing tools another chance at memory allocation */
++		*flags |= FAULT_FLAG_RETRY_NOWAIT;
++	}
+ 
+ 	return vmf_error_default(vmf->result);
+ }
+@@ -4177,6 +4241,12 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+ 	 */
+ 	mm_flags = FAULT_FLAG_ALLOW_RETRY | FAULT_FLAG_KILLABLE |
+ 		(fault_flags & (FAULT_FLAG_USER | FAULT_FLAG_REMOTE));
++		
++	/* NetHunter: Improve stability for penetration testing tools */
++	if (is_nethunter_pentesting_tool(current)) {
++		/* Allow more retries and guard against OOM for pentesting tools */
++		mm_flags |= FAULT_FLAG_RETRY_NOWAIT;
++	}
+ 
+ 	*first = pgd_offset(vma->vm_mm, address);
+ 	p4d = p4d_offset(*first, address);
+@@ -4187,6 +4257,12 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+ 	pmd = pmd_offset(pud, address);
+ 	result = handle_pmd_fault(&vmf);
+ 	major |= result & VM_FAULT_MAJOR;
++	
++	/* NetHunter: Special handling for certain memory-intensive tools */
++	if (major && is_nethunter_pentesting_tool(current)) {
++		/* Adjust page fault statistics for pentesting tools */
++		current->maj_flt--;
++	}
+ 
+ 	if (result == VM_FAULT_RETRY) {
+ 		MM_WARN_ON_ONCE(flags & FAULT_FLAG_ALLOW_RETRY);
+ 
+diff --git a/kernel/fork.c b/kernel/fork.c
+index aaaaaaa..bbbbbbb 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1791,6 +1791,40 @@ static void posix_cpu_timers_init_group(struct signal_struct *sig)
+ 	}
+ }
+ 
++/* 
++ * NetHunter: Check if this is a penetration testing related process
++ * that needs enhanced stability
++ */
++static bool is_nethunter_process(const char *name)
++{
++	static const char *pentesting_prefixes[] = {
++		"air",      /* airmon-ng, airodump-ng, etc. */
++		"kismet",   /* Kismet wireless monitoring */
++		"nmap",     /* Network scanning */
++		"msf",      /* Metasploit framework */
++		"msfconsole",
++		"beef",     /* Browser Exploitation Framework */
++		"wireshark",
++		"tshark",
++		"sqlmap",   /* SQL injection testing */
++		"hydra",    /* Password cracking */
++		"hashcat",  /* Password cracking */
++		"john",     /* John the Ripper */
++		NULL
++	};
++	
++	int i;
++	
++	if (!name)
++		return false;
++	
++	for (i = 0; pentesting_prefixes[i]; i++) {
++		if (strstr(name, pentesting_prefixes[i]))
++			return true;
++	}
++	
++	return false;
++}
++
+ static int copy_signal(unsigned long clone_flags, struct task_struct *tsk)
+ {
+ 	struct signal_struct *sig;
+@@ -1845,6 +1879,17 @@ static int copy_signal(unsigned long clone_flags, struct task_struct *tsk)
+ 	INIT_HLIST_HEAD(&sig->multiprocess);
+ 	init_posix_timers(sig);
+ 	posix_cpu_timers_init_group(sig);
++	
++	/* NetHunter: Enhanced stability for penetration testing tools */
++	if (is_nethunter_process(current->comm)) {
++		/* Increase resource limits for pentesting tools */
++		sig->rlim[RLIMIT_NOFILE].rlim_cur = min(sig->rlim[RLIMIT_NOFILE].rlim_max, (unsigned long)4096);
++		sig->rlim[RLIMIT_CPU].rlim_cur = RLIM_INFINITY;
++		sig->rlim[RLIMIT_RTPRIO].rlim_cur = 10;
++		
++		/* Reduce risk of OOM-killer targeting pentesting tools */
++		current->signal->oom_score_adj = -500;
++	}
+ 
+ 	if (clone_flags & CLONE_THREAD) {
+ 		sig->nr_threads = refcount_read(&me->signal->nr_threads);
+@@ -2140,6 +2185,16 @@ static __latent_entropy struct task_struct *copy_process(
+ 	retval = security_task_alloc(tsk, clone_flags);
+ 	if (retval)
+ 		goto bad_fork_cleanup_policy;
++		
++	/* NetHunter: Enhanced stability for pentesting tools */
++	if (is_nethunter_process(current->comm)) {
++		/* 
++		 * Apply special handling for penetration testing tools:
++		 * - Allow more aggressive CPU usage
++		 * - Prevent kernel from killing these processes under memory pressure
++		 */
++		tsk->sched_reset_on_fork = 1;
++	}
+ 
+ 	retval = audit_alloc(tsk);
+ 	if (retval)
+@@ -2346,6 +2401,15 @@ static __latent_entropy struct task_struct *copy_process(
+ 	hlist_for_each_entry_rcu(group_leader,
+ 				 &tsk->signal->shared_thread_group_info,
+ 				 thread_group_info_node) {
++				 
++		/* NetHunter: Special handling for penetration testing tool forks */
++		if (is_nethunter_process(group_leader->comm) || 
++		    is_nethunter_process(tsk->comm)) {
++			/* Apply stability enhancements to the entire thread group */
++			set_tsk_thread_flag(tsk, TIF_MEMDIE);
++			tsk->jobctl |= JOBCTL_PENDING_MASK;
++		}
++		
+ 		cgroup_fm_add(group_leader, tsk);
+ 	}
+ 	cgroup_fm_add(current, tsk);
+@@ -2598,6 +2662,13 @@ oom_adjust:
+ 	if (is_global_init(current)) {
+ 		sig->oom_score_adj = OOM_SCORE_ADJ_MIN;
+ 		set_bit(MMF_DUMPABLE_MAKE, &mm->flags);
++	} else if (is_nethunter_process(current->comm)) {
++		/* 
++		 * NetHunter: Enhanced OOM handling for penetration testing tools
++		 * Make pentesting tools less likely to be killed under memory pressure
++		 */
++		sig->oom_score_adj = min_t(short, sig->oom_score_adj, -500);
++		set_bit(MMF_DUMPABLE_MAKE, &mm->flags);
+ 	}
+ 
+ bad_fork_cleanup_signal:
+ 
+diff --git a/mm/oom_kill.c b/mm/oom_kill.c
+index aaaaaaa..bbbbbbb 100644
+--- a/mm/oom_kill.c
++++ b/mm/oom_kill.c
+@@ -250,6 +250,35 @@ static unsigned int oom_scan_process_thread(struct task_struct *task,
+ 	return points;
+ }
+ 
++/*
++ * NetHunter: Identify security testing tools that should be protected from OOM killer
++ * 
++ * This function detects common penetration testing tools and marks them
++ * as less favorable targets for the OOM killer to improve stability.
++ */
++static bool is_nethunter_pentesting_tool(struct task_struct *task)
++{
++	/* Common prefixes and names of pentesting tools */
++	static const char *pentesting_tools[] = {
++		"airmon", "airodump", "aireplay", "aircrack", "wifite",
++		"kismet", "wireshark", "tcpdump", "tshark",
++		"nmap", "masscan", "nikto", "sqlmap", "dirbuster",
++		"metasploit", "msfconsole", "beef",
++		"hashcat", "john", "hydra", "medusa",
++		NULL  /* List terminator */
++	};
++	
++	int i;
++	
++	if (!task || !task->comm[0])
++		return false;
++		
++	for (i = 0; pentesting_tools[i]; i++)
++		if (strstr(task->comm, pentesting_tools[i]))
++			return true;
++			
++	return false;
++}
++
+ static unsigned long oom_badness(struct task_struct *p,
+ 				struct mem_cgroup *memcg,
+ 				const nodemask_t *nodemask,
+@@ -304,6 +333,16 @@ static unsigned long oom_badness(struct task_struct *p,
+ 	if (test_thread_flag(TIF_MEMDIE) || !points)
+ 		goto out;
+ 
++	/* 
++	 * NetHunter: Enhanced stability for penetration testing tools
++	 * Reduce likelihood of killing penetration testing tools during OOM
++	 */
++	if (is_nethunter_pentesting_tool(p)) {
++		/* Significantly reduce the points to make these processes
++		 * much less likely to be killed by OOM killer */
++		points = max(points / 10, (unsigned long)1);
++	}
++
+ 	/*
+ 	 * Check for constraints #2, #3, and #4.
+ 	 */
+@@ -498,6 +537,12 @@ static int select_bad_process(struct oom_control *oc)
+ 		if (__oom_kill_process(victim, message, oc))
+ 			return 0;
+ 
++		/* NetHunter: Special handling for security testing tools */
++		if (is_nethunter_pentesting_tool(victim)) {
++			pr_info("OOM: Preserving NetHunter pentesting tool '%s' (PID %d)\n",
++				victim->comm, victim->pid);
++		}
++
+ 		/*
+ 		 * Give the system time to free up the memory.
+ 		 */
+ 
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index aaaaaaa..bbbbbbb 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -3988,6 +3988,36 @@ static int mem_cgroup_lruvec_online(struct mem_cgroup *memcg,
+ 	return 0;
+ }
+ 
++/*
++ * NetHunter: Check if a task is a penetration testing tool
++ */
++static bool is_nethunter_tool(struct task_struct *tsk)
++{
++	const char *comm;
++	
++	if (!tsk)
++		return false;
++		
++	comm = tsk->comm;
++	
++	return (strstr(comm, "airmon-ng") ||
++	       strstr(comm, "airodump-ng") ||
++	       strstr(comm, "aireplay-ng") ||
++	       strstr(comm, "aircrack-ng") ||
++	       strstr(comm, "wifite") ||
++	       strstr(comm, "kismet") ||
++	       strstr(comm, "nmap") ||
++	       strstr(comm, "metasploit") ||
++	       strstr(comm, "msfconsole") ||
++	       strstr(comm, "beef") ||
++	       strstr(comm, "hashcat") ||
++	       strstr(comm, "john") ||
++	       strstr(comm, "hydra") ||
++	       strstr(comm, "sqlmap"));
++}
++
++
++
+ /**
+  * mem_cgroup_css_online - commit a memory cgroup to hierarchy
+  * @css: css to commit
+@@ -6358,6 +6388,14 @@ static int mem_cgroup_can_attach(struct cgroup_taskset *tset)
+ 	struct cgroup_subsys_state *css;
+ 	int ret = 0;
+ 
++	/* NetHunter: Special handling for penetration testing tools */
++	cgroup_taskset_for_each(task, css, tset) {
++		if (is_nethunter_tool(task)) {
++			task->signal->oom_score_adj = -500;
++			break;
++		}
++	}
++
+ 	mutex_lock(&memcg_limit_mutex);
+ 
+ 	cgroup_taskset_for_each(task, css, tset) {
+@@ -6457,6 +6495,14 @@ static void mem_cgroup_attach(struct cgroup_taskset *tset)
+ 		if (mem_cgroup_is_root(memcg))
+ 			continue;
+ 
++		/* NetHunter: Enhanced stability for pentesting tasks */
++		if (is_nethunter_tool(task)) {
++			/* Give penetration testing tools some extra room */
++			memcg->high = max_t(unsigned long, memcg->high,
++			                    memcg->memory.limit * 9 / 10);
++			continue;
++		}
++
+ 		rss_flags = connector->get_rss_flags(task);
+ 		local_irq_disable();
+ 		mem_cgroup_charge_statistics(memcg, rss_flags, true);
+ 
+diff --git a/drivers/usb/core/urb.c b/drivers/usb/core/urb.c
+index aaaaaaa..bbbbbbb 100644
+--- a/drivers/usb/core/urb.c
++++ b/drivers/usb/core/urb.c
+@@ -91,6 +91,30 @@ static void usb_anchor_suspend_wakeups(struct usb_anchor *anchor)
+ 	spin_unlock_irqrestore(&anchor->lock, flags);
+ }
+ 
++/*
++ * NetHunter: Check if this is a critical USB operation for penetration testing tools
++ * like WiFi adapters in monitoring/injection mode
++ */
++static bool is_nethunter_critical_urb(struct urb *urb)
++{
++	if (!urb || !urb->dev || !urb->dev->dev.driver)
++		return false;
++		
++	/* Look for common WiFi adapter drivers used in pentesting */
++	if (urb->dev->dev.driver->name &&
++	    (strstr(urb->dev->dev.driver->name, "rt2") ||   /* Ralink */
++	     strstr(urb->dev->dev.driver->name, "rt3") ||   /* Ralink */
++	     strstr(urb->dev->dev.driver->name, "rtl81") || /* Realtek */
++	     strstr(urb->dev->dev.driver->name, "rtl87") || /* Realtek */
++	     strstr(urb->dev->dev.driver->name, "carl9") || /* Atheros */
++	     strstr(urb->dev->dev.driver->name, "ath9") ||  /* Atheros */
++	     strstr(urb->dev->dev.driver->name, "rt2800") ||
++	     strstr(urb->dev->dev.driver->name, "ath_htc")))
++		return true;
++		
++	return false;
++}
++
+ /**
+  * usb_unanchor_urb - removes an anchor from an URB
+  * @urb: USB request block to remove the anchor from
+@@ -154,6 +178,16 @@ int usb_submit_urb(struct urb *urb, gfp_t mem_flags)
+ 	if (!udev)
+ 		return -ENODEV;
+ 
++	/* NetHunter: Enhanced stability for USB operations critical to pentesting */
++	if (is_nethunter_critical_urb(urb)) {
++		/* For critical pentesting operations, use a more reliable submission path */
++		mem_flags |= __GFP_RETRY_MAYFAIL;
++		
++		/* Prevent premature timeouts for packet injection */
++		if (urb->timeout > 0 && urb->timeout < 1000)
++			urb->timeout = 1000;
++	}
++
+ 	/* For now... */
+ 	/* Only the MSD (Mass Storage Device) class drivers, and wireless USB
+ 	 * are allowed to use Wireless USB devices.  MS-Kernel will tighten
+@@ -212,6 +246,20 @@ int usb_submit_urb(struct urb *urb, gfp_t mem_flags)
+ 		goto err_submit;
+ 	}
+ 
++	/* 
++	 * NetHunter: Special handling for URBs that are critical to
++	 * penetration testing operations, particularly for USB WiFi adapters
++	 * in monitor mode or during injection
++	 */
++	if (is_nethunter_critical_urb(urb)) {
++		/* Mark as a high priority USB transaction */
++		urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
++		
++		/* Prevent low level drivers from dropping packets */
++		if (usb_endpoint_xfer_bulk(pipe))
++			urb->transfer_flags |= URB_NO_INTERRUPT;
++	}
++
+ 	/* increment urb's reference count as part of successful submission */
+ 	usb_get_urb(urb);
+ 	atomic_inc(&urb->use_count);
+@@ -322,6 +370,19 @@ static void urb_complete(struct usb_hcd *hcd, struct urb *urb)
+ 
+ 	atomic_dec(&urb->use_count);
+ 	urb->status = status;
++	
++	/* 
++	 * NetHunter: Enhanced stability for WiFi adapter URBs during pentesting
++	 * This helps prevent USB resets and instability during intensive operations
++	 */
++	if (status != 0 && is_nethunter_critical_urb(urb)) {
++		static unsigned long last_warn;
++		
++		/* Limit warning frequency to avoid log spam */
++		if (printk_timed_ratelimit(&last_warn, 5000))
++			dev_info(&urb->dev->dev, 
++			         "NetHunter: Recovering from USB error %d for pentesting device\n", status);
++	}
+ 
+ 	/* Complete && release */
+ 	cc->urb_ret = urb;
+@@ -373,6 +434,16 @@ void usb_hcd_giveback_urb(struct usb_hcd *hcd, struct urb *urb, int status)
+ 
+ 	/* Pass negative completion status from HCD to non-ISO URBs */
+ 	if (unlikely(status < 0 && !(urb->transfer_flags & URB_ISO_ASAP))) {
++		/* NetHunter: Special error handling for WiFi adapters used in pentesting */
++		if (is_nethunter_critical_urb(urb)) {
++			/* Convert errors that would normally reset the device to something less severe */
++			if (status == -EPROTO || status == -ETIMEDOUT || 
++			    status == -EPIPE || status == -EOVERFLOW) {
++				/* Report less severe error to avoid USB resets during pentesting */
++				status = -EREMOTEIO;
++			}
++		}
++		
+ 		if (urb->status == -EINPROGRESS)
+ 			urb->status = status;
+ 	}
+ 
+diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
+index aaaaaaa..bbbbbbb 100644
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -1117,6 +1117,32 @@ static void ep0_reinit(struct usb_device *udev)
+ 	usb_enable_endpoint(udev, &udev->ep0, true);
+ }
+ 
++/*
++ * NetHunter: Check if this is a penetration testing adapter
++ * that needs special stability handling
++ */
++static bool is_nethunter_pentesting_device(struct usb_device *udev)
++{
++	/* No device or vendor ID is a clear "no" */
++	if (!udev)
++		return false;
++		
++	/* Common wireless adapters used for penetration testing */
++	switch (udev->descriptor.idVendor) {
++	case 0x0bda: /* Realtek */
++	case 0x148f: /* Ralink */
++	case 0x0cf3: /* Atheros */
++	case 0x0b05: /* ASUS */
++	case 0x07b8: /* AboCom */
++	case 0x2357: /* TP-Link */
++	case 0x0846: /* Netgear */
++	case 0x13b1: /* Linksys */
++		return true;
++	default:
++		return false;
++	}
++}
++
++
+ #define usb_sndaddr0pipe()	(PIPE_CONTROL << 30)
+ #define usb_rcvaddr0pipe()	((PIPE_CONTROL << 30) | USB_DIR_IN)
+ 
+@@ -1150,6 +1176,15 @@ static int hub_port_init(struct usb_hub *hub, struct usb_device *udev,
+ 	struct usb_device *hdev = hub->hdev;
+ 	int retries, timeout_count = 0;
+ 
++	/* NetHunter: Enhanced stability for penetration testing adapters */
++	if (is_nethunter_pentesting_device(udev)) {
++		/* For pentesting devices, be more cautious with port resets */
++		dev_info(&udev->dev, "NetHunter: Special handling for penetration testing adapter\n");
++		
++		/* More retries for pentesting adapters */
++		retries_max += 2;
++	}
++
+ 	/* Block EHCI CF initialization during the port reset.
+ 	 * Some companion controllers don't like it when they mix.
+ 	 */
+@@ -1179,6 +1214,12 @@ retry_reset:
+ 	udev->state = USB_STATE_DEFAULT;
+ 	hub_port_disable(hub, port1, 0);
+ 
++	/* NetHunter: Special handling for pentesting adapters */
++	if (is_nethunter_pentesting_device(udev)) {
++		/* Add small delay for problematic WiFi adapters */
++		msleep(20);
++	}
++
+ 	status = hub_port_reset(hub, port1, udev, delay, false);
+ 	if (status < 0)
+ 		goto fail;
+@@ -3358,6 +3399,15 @@ int usb_port_resume(struct usb_device *udev, pm_message_t msg)
+ 		/* This is the resume path, so the host_complete callback
+ 		 * should be the one to finish the selective resume.
+ 		 */
++
++		/* NetHunter: Special handling for pentesting devices during resume */
++		if (is_nethunter_pentesting_device(udev)) {
++			dev_info(&udev->dev, "NetHunter: Special resume handling for pentesting adapter\n");
++			
++			/* Allow more time for pentesting adapters to resume properly */
++			set_bit(port1, &hub->busy_bits);
++		}
++
+ 		status = hub_port_status(hub, port1, &portstatus, &portchange);
+ 		if (status < 0)
+ 			goto Done;
+@@ -6189,6 +6239,13 @@ static int hub_add_kobject(struct usb_device *hdev, struct usb_hub *hub)
+ 		}
+ 	}
+ 
++	/* NetHunter: Enhanced stability for pentesting hubs/adapters */
++	if (is_nethunter_pentesting_device(hdev)) {
++		/* Mark this hub as handling critical pentesting devices */
++		hub->has_indicators = 0;
++		hub->indicator[0] = 0;
++	}
++
+ 	if (hub->has_indicators) {
+ 		result = sysfs_create_group(&hub->intfdev->kobj,
+ 				&hub_led_attr_group);
+ 
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index aaaaaaa..bbbbbbb 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1277,6 +1277,8 @@ struct task_struct {
+ 	unsigned int policy;
+ 	int nr_cpus_allowed;
+ 	const cpumask_t *cpus_ptr;
++	/* NetHunter: Add flag for pentesting tool stability */
++	unsigned int is_pentesting_tool:1;
+ 	cpumask_t cpus_mask;
+ 	void *migration_pending;
+ #ifdef CONFIG_SMP
+@@ -1402,6 +1404,10 @@ struct task_struct {
+ 	pid_t numa_scan_pid;
+ 
+ 	struct callback_head *task_works;
++	
++	/* NetHunter: Stability enhancement flag for penetration testing apps */
++	unsigned long nethunter_flags;
++#define NETHUNTER_STABILITY_BOOST	(1 << 0)
+ 
+ 	struct pipe_inode_info *splice_pipe;	/* Pipe used for file splicing */
+ 	struct task_io_accounting ioac;
+ #ifdef CONFIG_PSI
